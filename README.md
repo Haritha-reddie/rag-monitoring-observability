@@ -4,7 +4,9 @@
 
 A production-grade monitoring and observability layer for RAG systems. Adds Langfuse tracing, p50/p95/p99 latency tracking, cost per request, quality score monitoring, a live dashboard, and a CI regression gate to any RAG pipeline.
 
-This is Project 3 in the AI Engineer Portfolio Series and plugs directly into the Production RAG Application from Project 1.
+This is Project 3 in the AI Engineer Portfolio Series and is a direct continuation of Project 1 (Production RAG Application). It does not work as a standalone project. The monitoring layer wraps the RAG pipeline from Project 1 and adds full observability on top of it.
+
+Project 1 repo: https://github.com/Haritha-reddie/production-rag
 
 ## Table of Contents
 
