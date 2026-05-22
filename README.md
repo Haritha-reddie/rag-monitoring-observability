@@ -1,191 +1,364 @@
-# Production RAG — Ask My Docs
+# RAG Monitoring and Observability
 
-I built this because I was frustrated with how most RAG tutorials end. They show you how to embed some text, do a similarity search, and call an LLM. That works for a demo. It falls apart in production.
+[![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org/downloads/) [![Langfuse](https://img.shields.io/badge/Langfuse-Tracing-purple.svg)](https://langfuse.com/) [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-green.svg)](https://fastapi.tiangolo.com/)
 
-This project is my attempt to build a RAG system the way I'd actually want to deploy one — with hybrid retrieval, proper reranking, citation enforcement, and automated quality checks that run on every single push.
+A production-grade monitoring and observability layer for RAG systems. Adds Langfuse tracing, p50/p95/p99 latency tracking, cost per request, quality score monitoring, a live dashboard, and a CI regression gate to any RAG pipeline.
 
----
+This is Project 3 in the AI Engineer Portfolio Series and plugs directly into the Production RAG Application from Project 1.
 
-## The problem I was trying to solve
+## Table of Contents
 
-Most document Q&A systems have two failure modes that nobody talks about:
-
-**The vocabulary problem.** Your user asks "can I get a refund?" but your document says "return policy." Vector search might catch this. BM25 won't. But then your user asks "what does GDPR article 17 require?" and now vector search fails because the meaning is too diluted across the embedding space, while BM25 finds the exact phrase instantly. You need both.
-
-**The hallucination problem.** LLMs are trained to sound confident. If you ask a question and the retrieved context doesn't contain the answer, the model will often make something up rather than say it doesn't know. I've seen this wreck trust in AI systems faster than anything else. The fix isn't hoping the model behaves — it's building the system so the model literally cannot answer without a source.
-
-This project tackles both.
-
----
-
-## How it works
-
-### Step 1 — Ingestion
-
-Drop any `.txt`, `.pdf`, or `.md` file into `data/docs/`. The system chunks it into 512-token pieces with 50-token overlap (so context isn't lost at chunk boundaries), then builds two indexes:
-
-- A **ChromaDB vector index** using HuggingFace embeddings for semantic search
-- A **BM25 keyword index** for exact-match search
-
-Both indexes are saved to disk and reloaded on startup.
-
-### Step 2 — Hybrid retrieval
-
-When a question comes in, both indexes are queried simultaneously. BM25 returns its top 20 candidates. Vector search returns its top 20. Then Reciprocal Rank Fusion merges them — a chunk that appears in both lists scores higher than one that appears in only one. The formula is simple: `score = 1/(rank + 60)` summed across methods.
-
-The result is a merged, deduplicated list of the most relevant chunks, combining the precision of keyword search with the flexibility of semantic search.
-
-### Step 3 — Reranking
-
-The top 20 candidates from hybrid retrieval go to Cohere's reranker. This is the part most people skip, and it makes a huge difference.
-
-The difference between a bi-encoder (embeddings) and a cross-encoder (reranker) is this: embeddings encode the query and the document separately, then compare the vectors. A cross-encoder reads the query and the document together and scores their relationship directly. It's much more accurate, but too slow to run on thousands of chunks. Running it on 20 candidates is fast and gives you near-perfect precision.
-
-The top 3 chunks after reranking go to the LLM.
-
-### Step 4 — Generation with citation enforcement
-
-The system prompt tells the LLM three things:
-1. Only use the provided context chunks to answer
-2. Tag every factual claim with `[Source: chunk_id]`
-3. If the context doesn't contain the answer, say so — don't guess
-
-That third rule is the most important. When the reranker finds no relevant chunks (top score below threshold), the pipeline returns "I don't have enough information in the provided documents" instead of generating a potentially fabricated answer.
-
-### Step 5 — Automated evaluation
-
-After every push to main, GitHub Actions runs Ragas evaluation against a test set of Q&A pairs. Four metrics are checked:
-
-| Metric | What it actually measures | Threshold |
-|---|---|---|
-| Faithfulness | Did the LLM only use the retrieved context? | ≥ 0.85 |
-| Answer relevancy | Did the answer address what was asked? | ≥ 0.80 |
-| Context precision | Were the retrieved chunks actually relevant? | ≥ 0.75 |
-| Context recall | Did retrieval find everything it needed? | ≥ 0.75 |
-
-If any metric drops below its threshold, the build fails. This catches regressions from prompt changes, chunking changes, or retrieval parameter changes before they reach users.
+- [What This Project Does](#what-this-project-does)
+- [Why Monitoring Matters](#why-monitoring-matters)
+- [Components](#components)
+  - [Langfuse Tracing](#langfuse-tracing)
+  - [Metrics Collector](#metrics-collector)
+  - [Query Cache](#query-cache)
+  - [Monitoring Dashboard](#monitoring-dashboard)
+  - [CI Regression Gate](#ci-regression-gate)
+- [Project Structure](#project-structure)
+- [Setup](#setup)
+- [Running the Dashboard](#running-the-dashboard)
+- [CI Gate](#ci-gate)
+- [Sample Dashboard Output](#sample-dashboard-output)
 
 ---
 
-## Project layout
+## What This Project Does
+
+Every time a user asks a question in the RAG system, this monitoring layer:
+
+1. Sends a trace to Langfuse showing the full span tree: retrieval time, rerank time, generation time, token counts, and estimated cost
+2. Records latency and cost metrics locally for percentile calculations
+3. Serves a live dashboard at localhost:8002 showing p50/p95/p99 latency, total cost, error rate, and recent query history
+4. Runs a CI regression gate that fails the GitHub Actions build if p95 latency exceeds 5 seconds or error rate exceeds 5 percent
+
+---
+
+## Why Monitoring Matters
+
+Most AI engineers build the pipeline and stop there. Production systems need answers to these questions continuously:
+
+- Is the system getting slower over time?
+- Which queries are the most expensive?
+- Is the hallucination rate increasing after a prompt change?
+- Did the last code change break anything?
+
+Without monitoring, these questions can only be answered after users complain. With monitoring, regressions are caught automatically before they reach users.
+
+This is why the video this project is based on says monitoring is 70 percent of production AI work that nobody puts in their portfolio.
+
+---
+
+## Components
+
+### Langfuse Tracing
+
+Every RAG query is traced end to end with a span tree showing each step.
+
+```python
+from src.monitoring.tracer import RAGTracer
+
+tracer = RAGTracer()
+
+with tracer.trace(query="What is the return policy?") as trace:
+    # log the retrieval step
+    trace.log_retrieval(
+        candidates=20,
+        reranked=3,
+        latency=0.8,
+        top_scores=[0.916, 0.089, 0.005]
+    )
+
+    # log the generation step with token counts and cost
+    trace.log_generation(
+        model="llama-3.3-70b-versatile",
+        prompt=prompt_text,
+        response=answer,
+        input_tokens=312,
+        output_tokens=148,
+        latency=2.1
+    )
+
+    # log quality scores from Ragas
+    trace.log_quality(faithfulness=0.92, relevancy=0.88)
+
+    trace.set_output(answer)
+```
+
+Each trace appears in your Langfuse dashboard at cloud.langfuse.com with:
+- Full span tree showing time spent at each step
+- Token counts and estimated cost in USD
+- Faithfulness and relevancy scores
+- Model name and parameters
+
+**Cost estimation**
+
+```python
+MODEL_COST = {
+    "llama-3.3-70b-versatile": {"input": 0.00059, "output": 0.00079},
+}
+
+cost = (input_tokens / 1000) * rates["input"] + (output_tokens / 1000) * rates["output"]
+```
+
+---
+
+### Metrics Collector
+
+Records every query locally and computes percentile latency, cost aggregates, and quality score averages.
+
+```python
+from src.monitoring.metrics import get_collector, QueryMetric
+import time
+
+collector = get_collector()
+
+collector.record(QueryMetric(
+    timestamp=time.time(),
+    query="What is the return policy?",
+    total_latency=2.84,
+    retrieval_latency=0.72,
+    generation_latency=2.12,
+    model="llama-3.3-70b-versatile",
+    input_tokens=312,
+    output_tokens=148,
+    cost_usd=0.000301,
+))
+```
+
+Getting a summary over the last 24 hours:
+
+```python
+summary = collector.summary(window_hours=24)
+
+print(summary.p50_latency)    # 2.461
+print(summary.p95_latency)    # 6.174
+print(summary.p99_latency)    # 6.989
+print(summary.total_cost_usd) # 0.0022
+print(summary.error_rate)     # 0.0
+```
+
+The difference between average and p95 latency is important. An average of 2.8 seconds looks fine. A p95 of 6.2 seconds means 5 percent of users are waiting over 6 seconds. That is what production SRE teams measure.
+
+---
+
+### Query Cache
+
+Caches high-frequency queries to reduce latency and cost for repeated questions.
+
+```python
+from src.monitoring.cache import get_cache
+
+cache = get_cache()
+
+# check cache before running the RAG pipeline
+cached = cache.get("What is the return policy?")
+if cached:
+    return cached  # returns in ~5ms instead of ~3 seconds
+
+# run the full pipeline
+response = rag_chain.run(query)
+
+# store result with 1 hour TTL
+cache.set("What is the return policy?", {"answer": response.answer})
+```
+
+Cache statistics:
+
+```python
+stats = cache.stats()
+# {
+#   "total_entries": 12,
+#   "active_entries": 10,
+#   "expired_entries": 2,
+#   "total_hits": 47,
+#   "max_entries": 500
+# }
+```
+
+The cache uses SHA-256 hashing of the normalized query as the key, TTL-based expiry at 1 hour, and LRU eviction when the cache exceeds 500 entries.
+
+---
+
+### Monitoring Dashboard
+
+A live dashboard served at localhost:8002 showing all metrics in real time.
+
+```bash
+python -m src.monitoring.dashboard
+```
+
+The dashboard shows:
+
+- Total queries and error rate
+- Average latency in seconds
+- Total cost and average cost per query
+- Average faithfulness and relevancy scores
+- Latency percentile bars for p50, p95, p99, and average
+- CI regression gate status per metric
+- Recent queries table with timestamp, latency, tokens, cost, and status
+
+The dashboard auto-refreshes every 10 seconds and supports time window filtering: 1 hour, 6 hours, 24 hours, and all time.
+
+---
+
+### CI Regression Gate
+
+Checks current metrics against thresholds and exits with code 1 if any check fails.
+
+```python
+from src.monitoring.metrics import get_collector
+
+collector = get_collector()
+checks = collector.check_regression(
+    p95_threshold=5.0,
+    faithfulness_threshold=0.80,
+    error_rate_threshold=0.05,
+)
+```
+
+Sample output from a passing run:
 
 ```
-production-rag/
+Check                     Value    Threshold   Status
+p95_latency               4.23s    5.000s      PASS
+faithfulness              0.91     0.800       PASS
+error_rate                0.000    0.050       PASS
+
+All checks passed. CI gate APPROVED.
+```
+
+Sample output from a failing run:
+
+```
+Check                     Value    Threshold   Status
+p95_latency               6.17s    5.000s      FAIL
+faithfulness              0.91     0.800       PASS
+error_rate                0.000    0.050       PASS
+
+CI gate FAILED:
+  p95_latency: 6.174 exceeded threshold 5.0
+```
+
+---
+
+## Project Structure
+
+```
+rag-monitoring/
 ├── src/
-│   ├── ingestion/
-│   │   ├── loader.py          load docs, chunk them, stamp each with a chunk_id
-│   │   └── indexer.py         build ChromaDB + BM25 indexes, persist to disk
-│   ├── retrieval/
-│   │   ├── hybrid.py          BM25 + vector search, RRF fusion
-│   │   └── reranker.py        Cohere cross-encoder, top 20 → top 3
-│   ├── generation/
-│   │   ├── prompt.py          system prompt with citation rules
-│   │   └── rag_chain.py       orchestrates the full pipeline
-│   └── evaluation/
-│       └── eval_pipeline.py   Ragas runner
-├── ui/
-│   ├── server.py              FastAPI — upload, query, status endpoints
-│   └── index.html             drag-drop upload + chat interface
-├── ci/
-│   └── run_evals.py           CI gate script, exits 1 if metrics fail
-├── tests/
-│   ├── test_retrieval.py      unit tests for RRF and BM25
-│   ├── test_generation.py     unit tests for prompt citation enforcement
-│   └── eval_dataset.json      ground truth Q&A pairs
-├── data/docs/
-│   └── acme_policy.txt        sample document
-└── .github/workflows/
-    └── rag_eval.yml           GitHub Actions pipeline
+│   └── monitoring/
+│       ├── __init__.py
+│       ├── tracer.py          Langfuse tracing wrapper with cost estimation
+│       ├── metrics.py         p50/p95/p99 latency collector and aggregator
+│       ├── cache.py           TTL query cache with LRU eviction
+│       └── dashboard.py       FastAPI dashboard server and UI
+└── ci/
+    └── run_monitoring_gate.py CI gate script, exits 1 on regression
 ```
 
 ---
 
-## Getting it running
+## Setup
 
-You need three things: a Groq API key (free), a Cohere API key (free trial), and Python 3.11.
+**Step 1: Get a free Langfuse account**
+
+Go to cloud.langfuse.com, sign up, create a project named production-rag, and copy your API keys from Settings.
+
+**Step 2: Add keys to your .env**
+
+```
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_HOST=https://cloud.langfuse.com
+P95_LATENCY_THRESHOLD=5.0
+FAITHFULNESS_THRESHOLD=0.80
+ERROR_RATE_THRESHOLD=0.05
+```
+
+**Step 3: Install dependencies**
 
 ```bash
-git clone https://github.com/Haritha-reddie/production-rag.git
-cd production-rag
+pip install langfuse==2.36.2 fastapi==0.115.0 uvicorn==0.30.6 numpy
+```
 
-conda activate ragenv
-pip install -r requirements.txt
+---
 
-cp .env.example .env
-# add your GROQ_API_KEY and COHERE_API_KEY
+## Running the Dashboard
 
+```bash
 set -a && source .env && set +a
-python main.py ingest
-python main.py query "What is the return policy?"
+python -m src.monitoring.dashboard
 ```
 
-To use the web UI:
-```bash
-python -m uvicorn ui.server:app --host 0.0.0.0 --port 8000 --reload
-```
-
-Then open `http://localhost:8000`, drag in any document, and start asking questions.
+Open http://localhost:8002
 
 ---
 
-## Things worth testing
-
-The sample document (`acme_policy.txt`) is an ACME Corp policy guide. These questions should all get good cited answers:
-
-```
-What is the return policy?
-How do I contact customer support?
-What payment methods are accepted?
-How long does shipping take?
-```
-
-These should trigger the hallucination fallback — "I don't have enough information":
-
-```
-What is the CEO's name?
-What are the store hours on Sundays?
-What is the price of the premium plan?
-```
-
-That second set is important. If the system answers those with made-up information, something is wrong with the citation enforcement or the confidence threshold.
-
----
-
-## Running the evaluation
+## CI Gate
 
 ```bash
-python main.py eval
+python ci/run_monitoring_gate.py
 ```
 
-This runs the full Ragas suite against `tests/eval_dataset.json` and prints a table showing each metric and whether it passed. The same script runs in CI on every push.
+The gate reads metrics from the last 1 hour. If no queries exist in that window it skips the check and exits 0.
+
+In GitHub Actions, add this step after your Ragas evaluation:
+
+```yaml
+- name: Run monitoring regression gate
+  env:
+    P95_LATENCY_THRESHOLD: "5.0"
+    FAITHFULNESS_THRESHOLD: "0.80"
+    ERROR_RATE_THRESHOLD: "0.05"
+  run: python ci/run_monitoring_gate.py
+```
 
 ---
 
-## Stack
+## Sample Dashboard Output
 
-- **LLM** — Groq (Llama 3.3 70B) — free tier, fast inference
-- **Embeddings** — HuggingFace all-MiniLM-L6-v2 — runs locally, no API needed
-- **Vector store** — ChromaDB — persisted locally
-- **Keyword search** — rank-bm25 — BM25Okapi, pickled to disk
-- **Reranking** — Cohere rerank-english-v3.0 — free trial key
-- **Evaluation** — Ragas 0.2.x
-- **Backend** — FastAPI
-- **CI** — GitHub Actions
+After running 10 queries against the RAG system:
+
+```
+Total queries:    10
+Error rate:       0.0%
+Avg latency:      2.827s
+Total cost:       $0.0022
+Avg cost/query:   $0.000216
+
+Latency percentiles:
+  p50:  2.461s
+  p95:  6.174s
+  p99:  6.989s
+  avg:  2.827s
+
+CI Regression Gate:
+  p95_latency:   6.174s  threshold 5.0s   FAIL
+  faithfulness:  N/A     threshold 0.80   PASS
+  error_rate:    0.000   threshold 0.05   PASS
+```
+
+The p95 latency fails because query transformation generates 6 query variants, adding time. Raising the threshold to 8 seconds in .env resolves this for systems using query transformation.
 
 ---
 
-## What I'd add next
+## Part of the AI Engineer Portfolio Series
 
-A few things I deliberately left out to keep the scope focused:
-
-- **Redis cache** — right now repeated queries hit the LLM every time. A simple Redis cache on the query hash would cut latency to milliseconds for frequent questions
-- **RAPTOR indexing** — building a hierarchical summary tree over the chunks so the system can answer high-level questions that span multiple sections
-- **Streaming responses** — the UI currently waits for the full answer before displaying anything, which feels slow for longer responses
+| # | Project | Status |
+|---|---|---|
+| 1 | Production RAG Application | Complete |
+| 2 | Local SLM App with Ollama | Complete |
+| 3 | Monitoring and Observability | Complete |
+| 4 | Fine-Tuning with LoRA and DPO | Coming soon |
+| 5 | Real-Time Multimodal App | Coming soon |
 
 ---
 
 ## Author
 
-Haritha Gurram — Data Scientist and AI Engineer based in Dallas, TX.
+Haritha Gurram, Data Scientist and AI Engineer based in Dallas, TX.
 
-harithagurram5@gmail.com | [github.com/Haritha-reddie](https://github.com/Haritha-reddie)
+harithagurram5@gmail.com | github.com/Haritha-reddie
+
