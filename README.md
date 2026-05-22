@@ -360,7 +360,7 @@ The p95 latency fails because query transformation generates 6 query variants, a
 
 ## Author
 
-Haritha Gurram, Data Scientist and AI Engineer based in Dallas, TX.
+Haritha Gurram,AI Engineer based in Dallas, TX.
 
 harithagurram5@gmail.com | github.com/Haritha-reddie
 
